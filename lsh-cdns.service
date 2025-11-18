@@ -1,0 +1,25 @@
+[Unit]
+Description=lsh-cdns
+Wants=network-online.target
+After=network.target
+
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/lsh-cdns
+
+User=root
+Group=root
+
+#Environment=RACK_ENV=production
+
+#OOMScoreAdjust=-1000
+
+ExecStart=/opt/lsh-cdns/lsh-cdns
+
+#ExecStop=/usr/local/bin/bundle exec service -S /work/www/myunit/shared/tmp/pids/service.state stop
+#ExecReload=/usr/local/bin/bundle exec service -S /work/www/myunit/shared/tmp/pids/service.state restart
+#TimeoutSec=300
+
+[Install]
+WantedBy=multi-user.target

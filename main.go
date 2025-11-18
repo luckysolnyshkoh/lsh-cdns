@@ -20,6 +20,13 @@ var DNS_COUNT int
 var DnsServers []string
 var BIND_IP string                // IP для привязки DNS сервера
 var dnsMappings map[string]string // Маппинг FQDN -> Resolver IP
+var tldMappings []TldMapping      // Список TLD маппингов с приоритетами
+
+// TldMapping представляет маппинг TLD домена к резолверу
+type TldMapping struct {
+	Domain   string // домен (например, "ru", "ya.ru")
+	Resolver string // резолвер IP
+}
 
 func main() {
 	// Определяем путь к бинарнику и разделяем на директорию и имя
@@ -67,11 +74,24 @@ func main() {
 	}
 	debugLog("INFO", fmt.Sprintf("BIND_IP: %s", BIND_IP))
 
-	// Загружаем маппинги из конфигурационного файла
+	// Загружаем маппинги из конфигурационных файлов
 	err = loadDnsMappings()
 	if err != nil {
 		debugLog("ERROR", fmt.Sprintf("Ошибка загрузки DNS маппингов: %v", err))
 		return
+	}
+
+	// Загружаем TLD маппинги
+	err = loadTldMappings()
+	if err != nil {
+		debugLog("ERROR", fmt.Sprintf("Ошибка загрузки TLD маппингов: %v", err))
+		return
+	}
+
+	// Проверяем содержимое TLD маппингов
+	debugLog("DEBUG", fmt.Sprintf("Всего TLD маппингов загружено: %d", len(tldMappings)))
+	for i, mapping := range tldMappings {
+		debugLog("DEBUG", fmt.Sprintf("TLD маппинг %d: '%s' -> '%s'", i+1, mapping.Domain, mapping.Resolver))
 	}
 
 	// Обрабатываем DNS серверы
@@ -82,6 +102,239 @@ func main() {
 	startDnsServer()
 
 	debugLog("INFO", "Программа завершена успешно")
+}
+
+// loadTldMappings загружает TLD маппинги из файла main-domains.cfg
+func loadTldMappings() error {
+	file, err := os.Open("./etc/main-domains.cfg")
+	if err != nil {
+		return fmt.Errorf("не удалось открыть файл ./etc/main-domains.cfg: %v", err)
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	lineNumber := 0
+
+	for scanner.Scan() {
+		lineNumber++
+		line := strings.TrimSpace(scanner.Text())
+
+		// Пропускаем пустые строки и комментарии
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// Разделяем строку на домен и резолвер
+		parts := strings.Fields(line)
+		if len(parts) != 2 {
+			debugLog("WARNING", fmt.Sprintf("Строка %d в main-domains.cfg не содержит два поля: %s", lineNumber, line))
+			continue
+		}
+
+		domain := normalizeFQDN(strings.TrimSpace(parts[0]))
+		resolver := strings.TrimSpace(parts[1])
+
+		// Проверяем валидность IP адреса
+		if !isValidIP(resolver) {
+			debugLog("WARNING", fmt.Sprintf("Некорректный IP адрес в строке %d: %s", lineNumber, resolver))
+			continue
+		}
+
+		tldMappings = append(tldMappings, TldMapping{
+			Domain:   domain,
+			Resolver: resolver,
+		})
+
+		debugLog("DEBUG", fmt.Sprintf("Загружен TLD маппинг #%d: %s -> %s", len(tldMappings), domain, resolver))
+	}
+
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("ошибка чтения файла main-domains.cfg: %v", err)
+	}
+
+	// Сортируем по длине домена (более длинные домены first для приоритета)
+	tldMappings = sortTldMappings(tldMappings)
+
+	debugLog("INFO", fmt.Sprintf("Загружено %d TLD маппингов", len(tldMappings)))
+
+	// Выводим отсортированный список для отладки
+	for i, mapping := range tldMappings {
+		debugLog("DEBUG", fmt.Sprintf("TLD маппинг #%d (приоритет %d): %s -> %s", i+1, len(tldMappings)-i, mapping.Domain, mapping.Resolver))
+	}
+
+	return nil
+}
+
+// sortTldMappings сортирует TLD маппинги по длине домена (desc) для приоритета
+func sortTldMappings(mappings []TldMapping) []TldMapping {
+	// Простая сортировка пузырьком по длине домена (более длинные first)
+	for i := 0; i < len(mappings); i++ {
+		for j := i + 1; j < len(mappings); j++ {
+			if len(mappings[i].Domain) < len(mappings[j].Domain) {
+				mappings[i], mappings[j] = mappings[j], mappings[i]
+			}
+		}
+	}
+	return mappings
+}
+
+// findTldResolver находит резолвер для TLD домена
+func findTldResolver(fqdn string) (string, bool) {
+	debugLog("DEBUG", fmt.Sprintf("Ищем TLD резолвер для: %s", fqdn))
+
+	// Проверяем все TLD маппинги (уже отсортированы по приоритету)
+	for i, mapping := range tldMappings {
+		// Проверяем точное совпадение или суффикс
+		if fqdn == mapping.Domain || strings.HasSuffix(fqdn, "."+mapping.Domain) {
+			debugLog("DEBUG", fmt.Sprintf("Найден TLD маппинг #%d для %s: %s -> %s", i+1, fqdn, mapping.Domain, mapping.Resolver))
+			return mapping.Resolver, true
+		}
+	}
+
+	debugLog("DEBUG", fmt.Sprintf("TLD резолвер для %s не найден", fqdn))
+	return "", false
+}
+
+// startDnsServer запускает DNS прокси сервер
+func startDnsServer() {
+	// Создаем DNS сервер
+	dns.HandleFunc(".", dnsHandler)
+	server := &dns.Server{
+		Addr:    fmt.Sprintf("%s:53", BIND_IP),
+		Net:     "udp",
+		Handler: dns.HandlerFunc(dnsHandler),
+	}
+
+	debugLog("INFO", fmt.Sprintf("DNS сервер запущен на %s:53", BIND_IP))
+
+	// Запускаем сервер
+	err := server.ListenAndServe()
+	if err != nil {
+		debugLog("ERROR", fmt.Sprintf("Ошибка запуска DNS сервера: %v", err))
+		return
+	}
+}
+
+// dnsHandler обрабатывает DNS запросы
+func dnsHandler(w dns.ResponseWriter, r *dns.Msg) {
+	clientIP := w.RemoteAddr().String()
+
+	// Проверяем первый вопрос в запросе
+	if len(r.Question) == 0 {
+		debugLog("WARNING", "Получен пустой DNS запрос")
+		w.WriteMsg(r)
+		return
+	}
+
+	question := r.Question[0]
+	fqdn := normalizeFQDN(question.Name) // Нормализуем FQDN
+
+	debugLog("DEBUG", fmt.Sprintf("Получен DNS запрос от %s: %s", clientIP, fqdn))
+
+	// Создаем ответ
+	m := new(dns.Msg)
+	m.SetReply(r)
+
+	// Этап 1: Проверяем кастомные маппинги
+	if resolver, found := dnsMappings[fqdn]; found {
+		debugLog("INFO", fmt.Sprintf("FQDN %s найден в кастомном маппинге, резолвим через %s", fqdn, resolver))
+		if resolveThroughCustomResolverWithCheck(w, m, question, resolver) {
+			return // Успешно резолвили
+		}
+		// Если кастомный резолвер вернул NXDOMAIN, продолжаем к TLD
+		debugLog("DEBUG", fmt.Sprintf("Кастомный резолвер для %s вернул NXDOMAIN, пробуем TLD", fqdn))
+	}
+
+	// Этап 2: Проверяем TLD маппинги
+	if resolver, found := findTldResolver(fqdn); found {
+		debugLog("INFO", fmt.Sprintf("FQDN %s найден в TLD маппинге, резолвим через %s", fqdn, resolver))
+		if resolveThroughCustomResolverWithCheck(w, m, question, resolver) {
+			return // Успешно резолвили
+		}
+		// Если TLD резолвер вернул NXDOMAIN, продолжаем к стандартным DNS
+		debugLog("DEBUG", fmt.Sprintf("TLD резолвер для %s вернул NXDOMAIN, пробуем стандартные DNS", fqdn))
+	} else {
+		debugLog("DEBUG", fmt.Sprintf("FQDN %s не найден в TLD маппингах, используем стандартные DNS", fqdn))
+	}
+
+	// Этап 3: Если нет кастомного/TLD маппинга или они вернули NXDOMAIN, используем стандартные DNS серверы
+	if len(DnsServers) > 0 {
+		resolveThroughStandardResolvers(w, m, question)
+	} else {
+		debugLog("WARNING", "Нет доступных DNS серверов")
+		w.WriteMsg(m)
+	}
+}
+
+// resolveThroughCustomResolverWithCheck резолвит через кастомный резолвер и проверяет результат
+func resolveThroughCustomResolverWithCheck(w dns.ResponseWriter, m *dns.Msg, question dns.Question, resolver string) bool {
+	client := new(dns.Client)
+	client.Net = "udp"
+
+	// Создаем запрос для резолвера
+	req := new(dns.Msg)
+	req.SetQuestion(question.Name, question.Qtype)
+
+	// Отправляем запрос к резолверу
+	resp, _, err := client.Exchange(req, fmt.Sprintf("%s:53", resolver))
+	if err != nil {
+		debugLog("ERROR", fmt.Sprintf("Ошибка резолвинга через %s: %v", resolver, err))
+		return false
+	}
+
+	// Если это NXDOMAIN, считаем ошибкой
+	if resp.Rcode == dns.RcodeNameError {
+		debugLog("DEBUG", fmt.Sprintf("Резолвер %s вернул NXDOMAIN для %s", resolver, question.Name))
+		return false
+	}
+
+	// Для всех остальных кодов ответа копируем ответ как есть
+	m.Answer = resp.Answer
+	m.Ns = resp.Ns
+	m.Extra = resp.Extra
+	m.Rcode = resp.Rcode
+
+	debugLog("INFO", fmt.Sprintf("Резолвер %s вернул код %d, записей: %d для %s",
+		resolver, resp.Rcode, len(m.Answer), question.Name))
+
+	w.WriteMsg(m)
+	return true // Считаем любой ответ кроме NXDOMAIN успешным
+}
+
+// resolveThroughStandardResolvers резолвит через стандартные DNS серверы
+func resolveThroughStandardResolvers(w dns.ResponseWriter, m *dns.Msg, question dns.Question) {
+	client := new(dns.Client)
+	client.Net = "udp"
+
+	for i, resolver := range DnsServers {
+		debugLog("DEBUG", fmt.Sprintf("Пробуем резолвить через DNS сервер %d: %s", i+1, resolver))
+
+		// Создаем запрос для резолвера
+		req := new(dns.Msg)
+		req.SetQuestion(question.Name, question.Qtype)
+
+		// Отправляем запрос к резолверу
+		resp, _, err := client.Exchange(req, fmt.Sprintf("%s:53", resolver))
+		if err != nil {
+			debugLog("WARNING", fmt.Sprintf("Ошибка резолвинга через %s: %v", resolver, err))
+			continue
+		}
+
+		// Если получили ответ, возвращаем его
+		if resp != nil && len(resp.Answer) > 0 {
+			m.Answer = resp.Answer
+			m.Ns = resp.Ns
+			m.Extra = resp.Extra
+			m.Rcode = resp.Rcode
+
+			debugLog("INFO", fmt.Sprintf("Успешно резолвлен %s через %s", question.Name, resolver))
+			w.WriteMsg(m)
+			return
+		}
+	}
+
+	debugLog("WARNING", fmt.Sprintf("Не удалось резолвить %s через все доступные DNS серверы", question.Name))
+	w.WriteMsg(m)
 }
 
 // normalizeFQDN нормализует FQDN - убирает точку в конце и приводит к нижнему регистру
@@ -162,126 +415,6 @@ func processDnsServers() {
 	for i, dnsServer := range DnsServers {
 		debugLog("INFO", fmt.Sprintf("DNS сервер %d: %s", i+1, dnsServer))
 	}
-}
-
-// startDnsServer запускает DNS прокси сервер
-func startDnsServer() {
-	// Создаем DNS сервер
-	dns.HandleFunc(".", dnsHandler)
-	server := &dns.Server{
-		Addr:    fmt.Sprintf("%s:53", BIND_IP),
-		Net:     "udp",
-		Handler: dns.HandlerFunc(dnsHandler),
-	}
-
-	debugLog("INFO", fmt.Sprintf("DNS сервер запущен на %s:53", BIND_IP))
-
-	// Запускаем сервер
-	err := server.ListenAndServe()
-	if err != nil {
-		debugLog("ERROR", fmt.Sprintf("Ошибка запуска DNS сервера: %v", err))
-		return
-	}
-}
-
-// dnsHandler обрабатывает DNS запросы
-func dnsHandler(w dns.ResponseWriter, r *dns.Msg) {
-	clientIP := w.RemoteAddr().String()
-
-	// Проверяем первый вопрос в запросе
-	if len(r.Question) == 0 {
-		debugLog("WARNING", "Получен пустой DNS запрос")
-		w.WriteMsg(r)
-		return
-	}
-
-	question := r.Question[0]
-	fqdn := normalizeFQDN(question.Name) // Нормализуем FQDN
-
-	debugLog("DEBUG", fmt.Sprintf("Получен DNS запрос от %s: %s", clientIP, fqdn))
-
-	// Создаем ответ
-	m := new(dns.Msg)
-	m.SetReply(r)
-
-	// Проверяем кастомные маппинги
-	if resolver, found := dnsMappings[fqdn]; found {
-		debugLog("INFO", fmt.Sprintf("FQDN %s найден в кастомном маппинге, резолвим через %s", fqdn, resolver))
-		resolveThroughCustomResolver(w, m, question, resolver)
-		return
-	}
-
-	// Если нет кастомного маппинга, используем стандартные DNS серверы
-	if len(DnsServers) > 0 {
-		debugLog("DEBUG", fmt.Sprintf("FQDN %s не найден в кастомном маппинге, используем стандартные DNS", fqdn))
-		resolveThroughStandardResolvers(w, m, question)
-	} else {
-		debugLog("WARNING", "Нет доступных DNS серверов")
-		w.WriteMsg(m)
-	}
-}
-
-// resolveThroughCustomResolver резолвит через кастомный резолвер
-func resolveThroughCustomResolver(w dns.ResponseWriter, m *dns.Msg, question dns.Question, resolver string) {
-	client := new(dns.Client)
-	client.Net = "udp"
-
-	// Создаем запрос для резолвера
-	req := new(dns.Msg)
-	req.SetQuestion(question.Name, question.Qtype)
-
-	// Отправляем запрос к резолверу
-	resp, _, err := client.Exchange(req, fmt.Sprintf("%s:53", resolver))
-	if err != nil {
-		debugLog("ERROR", fmt.Sprintf("Ошибка резолвинга через %s: %v", resolver, err))
-		w.WriteMsg(m)
-		return
-	}
-
-	// Копируем ответ
-	m.Answer = resp.Answer
-	m.Ns = resp.Ns
-	m.Extra = resp.Extra
-	m.Rcode = resp.Rcode
-
-	debugLog("INFO", fmt.Sprintf("Успешно резолвлен %s через %s", question.Name, resolver))
-	w.WriteMsg(m)
-}
-
-// resolveThroughStandardResolvers резолвит через стандартные DNS серверы
-func resolveThroughStandardResolvers(w dns.ResponseWriter, m *dns.Msg, question dns.Question) {
-	client := new(dns.Client)
-	client.Net = "udp"
-
-	for i, resolver := range DnsServers {
-		debugLog("DEBUG", fmt.Sprintf("Пробуем резолвить через DNS сервер %d: %s", i+1, resolver))
-
-		// Создаем запрос для резолвера
-		req := new(dns.Msg)
-		req.SetQuestion(question.Name, question.Qtype)
-
-		// Отправляем запрос к резолверу
-		resp, _, err := client.Exchange(req, fmt.Sprintf("%s:53", resolver))
-		if err != nil {
-			debugLog("WARNING", fmt.Sprintf("Ошибка резолвинга через %s: %v", resolver, err))
-			continue
-		}
-
-		// Если получили ответ, возвращаем его
-		if resp != nil && len(resp.Answer) > 0 {
-			m.Answer = resp.Answer
-			m.Ns = resp.Ns
-			m.Extra = resp.Extra
-			m.Rcode = resp.Rcode
-
-			debugLog("INFO", fmt.Sprintf("Успешно резолвлен %s через %s", question.Name, resolver))
-			w.WriteMsg(m)
-			return
-		}
-	}
-
-	debugLog("WARNING", fmt.Sprintf("Не удалось резолвить %s через все доступные DNS серверы", question.Name))
-	w.WriteMsg(m)
 }
 
 // readDebugFromEnvFile читает только переменную DEBUG из файла
@@ -430,6 +563,23 @@ func createDirectories() {
 			fmt.Printf("INFO: Создана директория: %s\n", dir)
 		}
 	}
+
+	// Очищаем логфайл при запуске
+	err := clearLogFile()
+	if err != nil {
+		fmt.Printf("WARNING: Не удалось очистить логфайл: %v\n", err)
+	}
+}
+
+// clearLogFile очищает логфайл
+func clearLogFile() error {
+	// Создаем пустой файл или очищаем существующий
+	file, err := os.OpenFile("./logs/main.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("не удалось очистить логфайл: %v", err)
+	}
+	defer file.Close()
+	return nil
 }
 
 // writeToLogFile записывает сообщение в логфайл
