@@ -3,11 +3,16 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"log"
 	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/miekg/dns"
 )
@@ -21,6 +26,10 @@ var DnsServers []string
 var BIND_IP string                // IP для привязки DNS сервера
 var dnsMappings map[string]string // Маппинг FQDN -> Resolver IP
 var tldMappings []TldMapping      // Список TLD маппингов с приоритетами
+var OperatingSystem string        // "linux" или "windows"
+var configPath string             // Путь к директории конфигурации
+var logsPath string               // Путь к директории логов
+var dnsServer *dns.Server         // Ссылка на сервер для корректной остановки
 
 // TldMapping представляет маппинг TLD домена к резолверу
 type TldMapping struct {
@@ -28,24 +37,100 @@ type TldMapping struct {
 	Resolver string // резолвер IP
 }
 
-func main() {
-	// Определяем путь к бинарнику и разделяем на директорию и имя
-	var err error
-	fullBinaryPath, err := filepath.Abs(os.Args[0])
-	if err != nil {
-		fmt.Printf("Ошибка определения пути к бинарнику: %v\n", err)
-		return
+// detectOS определяет тип операционной системы
+func detectOS() string {
+	return runtime.GOOS // "linux" или "windows"
+}
+
+// isServiceMode определяет, нужно ли запускаться в режиме службы
+func isServiceMode() bool {
+	if runtime.GOOS != "windows" {
+		return false // На Linux службы запускаются через systemd
 	}
 
-	// Разделяем полный путь на директорию и имя файла
-	BinaryPath = filepath.Dir(fullBinaryPath)
-	BinaryName = filepath.Base(fullBinaryPath)
+	// Проверяем аргументы командной строки
+	for _, arg := range os.Args {
+		if arg == "--service" || arg == "-service" {
+			return true
+		}
+	}
+
+	// Проверяем переменные окружения Windows Service
+	return os.Getenv("SESSIONNAME") == "Services"
+}
+
+// main() - точка входа для всех ОС
+func main() {
+	// Определяем режим запуска
+	if isServiceMode() && runtime.GOOS == "windows" {
+		// Режим службы Windows
+		runWindowsService() // Будет объявлена в service_windows.go
+	} else {
+		// Консольный режим (Linux + Windows)
+		runConsole()
+	}
+}
+
+// runWindowsService объявляется в service_windows.go
+//func runWindowsService()
+
+// runConsole запускает в консольном режиме
+func runConsole() {
+	// Определяем ОС
+	OperatingSystem = detectOS()
+
+	// Настраиваем пути
+	setupPaths()
+
+	debugLog("INFO", fmt.Sprintf("Запуск в консольном режиме"))
+	debugLog("INFO", fmt.Sprintf("ОС: %s", OperatingSystem))
+	debugLog("INFO", fmt.Sprintf("Путь к бинарнику: %s", BinaryPath))
+	debugLog("INFO", fmt.Sprintf("Путь к конфигурации: %s", configPath))
+	debugLog("INFO", fmt.Sprintf("Путь к логам: %s", logsPath))
 
 	// Создаем необходимые директории
 	createDirectories()
 
+	// Читаем конфигурацию
+	loadConfiguration()
+
+	// Настраиваем graceful shutdown
+	setupGracefulShutdown()
+
+	// Запускаем DNS сервер
+	debugLog("INFO", "Запуск DNS прокси сервера...")
+	startDnsServer()
+
+	debugLog("INFO", "Программа завершена успешно")
+}
+
+func setupPaths() {
+	// Определяем путь к бинарнику
+	fullBinaryPath, err := filepath.Abs(os.Args[0])
+	if err != nil {
+		log.Printf("Ошибка определения пути к бинарнику: %v", err)
+		return
+	}
+
+	BinaryPath = filepath.Dir(fullBinaryPath)
+	BinaryName = filepath.Base(fullBinaryPath)
+
+	// ВСЕГДА используем каталог с бинарником (как было раньше)
+	configPath = filepath.Join(BinaryPath, "etc")
+	logsPath = filepath.Join(BinaryPath, "logs")
+
+	debugLog("INFO", fmt.Sprintf("Путь к директории с бинарником: %s", BinaryPath))
+	debugLog("INFO", fmt.Sprintf("Путь к конфигурации: %s", configPath))
+	debugLog("INFO", fmt.Sprintf("Путь к логам: %s", logsPath))
+}
+
+// loadConfiguration загружает конфигурацию
+func loadConfiguration() {
+	// Формируем путь к env файлу
+	envFilePath := filepath.Join(configPath, "main.env")
+
 	// Сначала читаем только DEBUG из env файла
-	err = readDebugFromEnvFile("./etc/main.env")
+	err := readDebugFromEnvFile(envFilePath)
 	if err != nil {
 		fmt.Printf("Ошибка чтения DEBUG из env файла: %v\n", err)
 		return
@@ -56,7 +141,7 @@ func main() {
 	debugLog("INFO", fmt.Sprintf("Уровень DEBUG: %d", DEBUG))
 
 	// Теперь читаем все переменные окружения из файла
-	err = readEnvFile("./etc/main.env")
+	err = readEnvFile(envFilePath)
 	if err != nil {
 		debugLog("ERROR", fmt.Sprintf("Ошибка чтения env файла: %v", err))
 		return
@@ -90,25 +175,33 @@ func main() {
 
 	// Проверяем содержимое TLD маппингов
 	debugLog("DEBUG", fmt.Sprintf("Всего TLD маппингов загружено: %d", len(tldMappings)))
-	for i, mapping := range tldMappings {
-		debugLog("DEBUG", fmt.Sprintf("TLD маппинг %d: '%s' -> '%s'", i+1, mapping.Domain, mapping.Resolver))
-	}
 
 	// Обрабатываем DNS серверы
 	processDnsServers()
+}
 
-	// Запускаем DNS сервер
-	debugLog("INFO", "Запуск DNS прокси сервера...")
-	startDnsServer()
+func setupGracefulShutdown() {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM)
 
-	debugLog("INFO", "Программа завершена успешно")
+	go func() {
+		<-c
+		debugLog("INFO", "Получен сигнал завершения, останавливаем сервер...")
+		gracefulShutdown()
+
+		// Принудительный выход если сервер не остановился за 5 секунд
+		time.Sleep(5 * time.Second)
+		os.Exit(0)
+	}()
 }
 
 // loadTldMappings загружает TLD маппинги из файла main-domains.cfg
 func loadTldMappings() error {
-	file, err := os.Open("./etc/main-domains.cfg")
+	configFilePath := filepath.Join(configPath, "main-domains.cfg")
+
+	file, err := os.Open(configFilePath)
 	if err != nil {
-		return fmt.Errorf("не удалось открыть файл ./etc/main-domains.cfg: %v", err)
+		return fmt.Errorf("не удалось открыть файл %s: %v", configFilePath, err)
 	}
 	defer file.Close()
 
@@ -157,17 +250,11 @@ func loadTldMappings() error {
 
 	debugLog("INFO", fmt.Sprintf("Загружено %d TLD маппингов", len(tldMappings)))
 
-	// Выводим отсортированный список для отладки
-	for i, mapping := range tldMappings {
-		debugLog("DEBUG", fmt.Sprintf("TLD маппинг #%d (приоритет %d): %s -> %s", i+1, len(tldMappings)-i, mapping.Domain, mapping.Resolver))
-	}
-
 	return nil
 }
 
 // sortTldMappings сортирует TLD маппинги по длине домена (desc) для приоритета
 func sortTldMappings(mappings []TldMapping) []TldMapping {
-	// Простая сортировка пузырьком по длине домена (более длинные first)
 	for i := 0; i < len(mappings); i++ {
 		for j := i + 1; j < len(mappings); j++ {
 			if len(mappings[i].Domain) < len(mappings[j].Domain) {
@@ -182,9 +269,7 @@ func sortTldMappings(mappings []TldMapping) []TldMapping {
 func findTldResolver(fqdn string) (string, bool) {
 	debugLog("DEBUG", fmt.Sprintf("Ищем TLD резолвер для: %s", fqdn))
 
-	// Проверяем все TLD маппинги (уже отсортированы по приоритету)
 	for i, mapping := range tldMappings {
-		// Проверяем точное совпадение или суффикс
 		if fqdn == mapping.Domain || strings.HasSuffix(fqdn, "."+mapping.Domain) {
 			debugLog("DEBUG", fmt.Sprintf("Найден TLD маппинг #%d для %s: %s -> %s", i+1, fqdn, mapping.Domain, mapping.Resolver))
 			return mapping.Resolver, true
@@ -195,20 +280,17 @@ func findTldResolver(fqdn string) (string, bool) {
 	return "", false
 }
 
-// startDnsServer запускает DNS прокси сервер
 func startDnsServer() {
-	// Создаем DNS сервер
 	dns.HandleFunc(".", dnsHandler)
-	server := &dns.Server{
+	dnsServer = &dns.Server{
 		Addr:    fmt.Sprintf("%s:53", BIND_IP),
-		Net:     "udp",
+		Net:     "udp4",
 		Handler: dns.HandlerFunc(dnsHandler),
 	}
 
-	debugLog("INFO", fmt.Sprintf("DNS сервер запущен на %s:53", BIND_IP))
+	debugLog("INFO", fmt.Sprintf("DNS сервер запущен на %s:53 (только IPv4)", BIND_IP))
 
-	// Запускаем сервер
-	err := server.ListenAndServe()
+	err := dnsServer.ListenAndServe()
 	if err != nil {
 		debugLog("ERROR", fmt.Sprintf("Ошибка запуска DNS сервера: %v", err))
 		return
@@ -219,7 +301,6 @@ func startDnsServer() {
 func dnsHandler(w dns.ResponseWriter, r *dns.Msg) {
 	clientIP := w.RemoteAddr().String()
 
-	// Проверяем первый вопрос в запросе
 	if len(r.Question) == 0 {
 		debugLog("WARNING", "Получен пустой DNS запрос")
 		w.WriteMsg(r)
@@ -227,11 +308,10 @@ func dnsHandler(w dns.ResponseWriter, r *dns.Msg) {
 	}
 
 	question := r.Question[0]
-	fqdn := normalizeFQDN(question.Name) // Нормализуем FQDN
+	fqdn := normalizeFQDN(question.Name)
 
 	debugLog("DEBUG", fmt.Sprintf("Получен DNS запрос от %s: %s", clientIP, fqdn))
 
-	// Создаем ответ
 	m := new(dns.Msg)
 	m.SetReply(r)
 
@@ -239,25 +319,21 @@ func dnsHandler(w dns.ResponseWriter, r *dns.Msg) {
 	if resolver, found := dnsMappings[fqdn]; found {
 		debugLog("INFO", fmt.Sprintf("FQDN %s найден в кастомном маппинге, резолвим через %s", fqdn, resolver))
 		if resolveThroughCustomResolverWithCheck(w, m, question, resolver) {
-			return // Успешно резолвили
+			return
 		}
-		// Если кастомный резолвер вернул NXDOMAIN, продолжаем к TLD
-		debugLog("DEBUG", fmt.Sprintf("Кастомный резолвер для %s вернул NXDOMAIN, пробуем TLD", fqdn))
 	}
 
 	// Этап 2: Проверяем TLD маппинги
 	if resolver, found := findTldResolver(fqdn); found {
 		debugLog("INFO", fmt.Sprintf("FQDN %s найден в TLD маппинге, резолвим через %s", fqdn, resolver))
 		if resolveThroughCustomResolverWithCheck(w, m, question, resolver) {
-			return // Успешно резолвили
+			return
 		}
-		// Если TLD резолвер вернул NXDOMAIN, продолжаем к стандартным DNS
-		debugLog("DEBUG", fmt.Sprintf("TLD резолвер для %s вернул NXDOMAIN, пробуем стандартные DNS", fqdn))
 	} else {
 		debugLog("DEBUG", fmt.Sprintf("FQDN %s не найден в TLD маппингах, используем стандартные DNS", fqdn))
 	}
 
-	// Этап 3: Если нет кастомного/TLD маппинга или они вернули NXDOMAIN, используем стандартные DNS серверы
+	// Этап 3: Стандартные DNS серверы
 	if len(DnsServers) > 0 {
 		resolveThroughStandardResolvers(w, m, question)
 	} else {
@@ -266,29 +342,25 @@ func dnsHandler(w dns.ResponseWriter, r *dns.Msg) {
 	}
 }
 
-// resolveThroughCustomResolverWithCheck резолвит через кастомный резолвер и проверяет результат
+// resolveThroughCustomResolverWithCheck резолвит через кастомный резолвер
 func resolveThroughCustomResolverWithCheck(w dns.ResponseWriter, m *dns.Msg, question dns.Question, resolver string) bool {
 	client := new(dns.Client)
-	client.Net = "udp"
+	client.Net = "udp4"
 
-	// Создаем запрос для резолвера
 	req := new(dns.Msg)
 	req.SetQuestion(question.Name, question.Qtype)
 
-	// Отправляем запрос к резолверу
 	resp, _, err := client.Exchange(req, fmt.Sprintf("%s:53", resolver))
 	if err != nil {
 		debugLog("ERROR", fmt.Sprintf("Ошибка резолвинга через %s: %v", resolver, err))
 		return false
 	}
 
-	// Если это NXDOMAIN, считаем ошибкой
 	if resp.Rcode == dns.RcodeNameError {
 		debugLog("DEBUG", fmt.Sprintf("Резолвер %s вернул NXDOMAIN для %s", resolver, question.Name))
 		return false
 	}
 
-	// Для всех остальных кодов ответа копируем ответ как есть
 	m.Answer = resp.Answer
 	m.Ns = resp.Ns
 	m.Extra = resp.Extra
@@ -298,29 +370,26 @@ func resolveThroughCustomResolverWithCheck(w dns.ResponseWriter, m *dns.Msg, que
 		resolver, resp.Rcode, len(m.Answer), question.Name))
 
 	w.WriteMsg(m)
-	return true // Считаем любой ответ кроме NXDOMAIN успешным
+	return true
 }
 
 // resolveThroughStandardResolvers резолвит через стандартные DNS серверы
 func resolveThroughStandardResolvers(w dns.ResponseWriter, m *dns.Msg, question dns.Question) {
 	client := new(dns.Client)
-	client.Net = "udp"
+	client.Net = "udp4"
 
 	for i, resolver := range DnsServers {
 		debugLog("DEBUG", fmt.Sprintf("Пробуем резолвить через DNS сервер %d: %s", i+1, resolver))
 
-		// Создаем запрос для резолвера
 		req := new(dns.Msg)
 		req.SetQuestion(question.Name, question.Qtype)
 
-		// Отправляем запрос к резолверу
 		resp, _, err := client.Exchange(req, fmt.Sprintf("%s:53", resolver))
 		if err != nil {
 			debugLog("WARNING", fmt.Sprintf("Ошибка резолвинга через %s: %v", resolver, err))
 			continue
 		}
 
-		// Если получили ответ, возвращаем его
 		if resp != nil && len(resp.Answer) > 0 {
 			m.Answer = resp.Answer
 			m.Ns = resp.Ns
@@ -337,21 +406,21 @@ func resolveThroughStandardResolvers(w dns.ResponseWriter, m *dns.Msg, question 
 	w.WriteMsg(m)
 }
 
-// normalizeFQDN нормализует FQDN - убирает точку в конце и приводит к нижнему регистру
+// normalizeFQDN нормализует FQDN
 func normalizeFQDN(fqdn string) string {
-	// Убираем точку в конце если есть
 	fqdn = strings.TrimSuffix(fqdn, ".")
-	// Приводим к нижнему регистру для корректного сравнения
 	return strings.ToLower(fqdn)
 }
 
 // loadDnsMappings загружает маппинги из файла main.cfg
 func loadDnsMappings() error {
+	configFilePath := filepath.Join(configPath, "main.cfg")
+
 	dnsMappings = make(map[string]string)
 
-	file, err := os.Open("./etc/main.cfg")
+	file, err := os.Open(configFilePath)
 	if err != nil {
-		return fmt.Errorf("не удалось открыть файл ./etc/main.cfg: %v", err)
+		return fmt.Errorf("не удалось открыть файл %s: %v", configFilePath, err)
 	}
 	defer file.Close()
 
@@ -362,22 +431,19 @@ func loadDnsMappings() error {
 		lineNumber++
 		line := strings.TrimSpace(scanner.Text())
 
-		// Пропускаем пустые строки и комментарии
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 
-		// Разделяем строку на FQDN и Resolver IP
 		parts := strings.Fields(line)
 		if len(parts) != 2 {
 			debugLog("WARNING", fmt.Sprintf("Строка %d в main.cfg не содержит два поля: %s", lineNumber, line))
 			continue
 		}
 
-		fqdn := normalizeFQDN(strings.TrimSpace(parts[0])) // Нормализуем FQDN
+		fqdn := normalizeFQDN(strings.TrimSpace(parts[0]))
 		resolver := strings.TrimSpace(parts[1])
 
-		// Проверяем валидность IP адреса
 		if !isValidIP(resolver) {
 			debugLog("WARNING", fmt.Sprintf("Некорректный IP адрес в строке %d: %s", lineNumber, resolver))
 			continue
@@ -410,7 +476,6 @@ func processDnsServers() {
 		}
 	}
 
-	// Цикл по слайсу DNS серверов
 	debugLog("INFO", fmt.Sprintf("Загружено %d DNS серверов", len(DnsServers)))
 	for i, dnsServer := range DnsServers {
 		debugLog("INFO", fmt.Sprintf("DNS сервер %d: %s", i+1, dnsServer))
@@ -430,25 +495,20 @@ func readDebugFromEnvFile(filepath string) error {
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 
-		// Пропускаем пустые строки и комментарии
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 
-		// Ищем знак "="
 		equalIndex := strings.Index(line, "=")
 		if equalIndex == -1 {
 			continue
 		}
 
-		// Извлекаем ключ и значение
 		key := strings.TrimSpace(line[:equalIndex])
 		value := strings.TrimSpace(line[equalIndex+1:])
 
-		// Убираем кавычки если есть
 		value = strings.Trim(value, `"'`)
 
-		// Если это переменная DEBUG, устанавливаем ее
 		if key == "DEBUG" {
 			if debugInt, err := strconv.Atoi(value); err == nil {
 				DEBUG = debugInt
@@ -456,7 +516,7 @@ func readDebugFromEnvFile(filepath string) error {
 				fmt.Printf("WARNING: Некорректное значение DEBUG в env файле: %s, используем 0\n", value)
 				DEBUG = 0
 			}
-			return nil // Нашли DEBUG, можно выходить
+			return nil
 		}
 	}
 
@@ -464,27 +524,24 @@ func readDebugFromEnvFile(filepath string) error {
 		return fmt.Errorf("ошибка чтения файла %s: %v", filepath, err)
 	}
 
-	// Если DEBUG не найден, оставляем 0
 	return nil
 }
 
-// setDebugLevel устанавливает уровень DEBUG (если уже установлен, не меняет)
+// setDebugLevel устанавливает уровень DEBUG
 func setDebugLevel() {
-	// DEBUG уже установлен в readDebugFromEnvFile, здесь можно добавить дополнительную логику если нужно
+	// DEBUG уже установлен
 }
 
-// debugLog - основная функция для логирования в зависимости от уровня DEBUG
+// debugLog - основная функция для логирования
 func debugLog(level, message string) {
-	// Если дебаг отключен, ничего не выводим
 	if DEBUG == 0 {
 		return
 	}
 
-	// Формируем сообщение
 	logMessage := fmt.Sprintf("[%s] %s", level, message)
 
-	// Выводим на экран если DEBUG >= 1
-	if DEBUG >= 1 {
+	// Выводим на экран если DEBUG >= 1 и DEBUG != 2
+	if DEBUG >= 1 && DEBUG != 2 {
 		fmt.Println(logMessage)
 	}
 
@@ -492,7 +549,6 @@ func debugLog(level, message string) {
 	if DEBUG >= 2 {
 		err := writeToLogFile(logMessage)
 		if err != nil {
-			// Если не удалось записать в файл, выводим на экран
 			fmt.Printf("КРИТИЧЕСКАЯ ОШИБКА: Не удалось записать в логфайл: %v\n", err)
 		}
 	}
@@ -513,26 +569,21 @@ func readEnvFile(filepath string) error {
 		lineNumber++
 		line := strings.TrimSpace(scanner.Text())
 
-		// Пропускаем пустые строки и комментарии
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 
-		// Ищем знак "="
 		equalIndex := strings.Index(line, "=")
 		if equalIndex == -1 {
 			debugLog("WARNING", fmt.Sprintf("Строка %d в файле %s не содержит знак '='", lineNumber, filepath))
 			continue
 		}
 
-		// Извлекаем ключ и значение
 		key := strings.TrimSpace(line[:equalIndex])
 		value := strings.TrimSpace(line[equalIndex+1:])
 
-		// Убираем кавычки если есть
 		value = strings.Trim(value, `"'`)
 
-		// Устанавливаем переменную окружения
 		err := os.Setenv(key, value)
 		if err != nil {
 			debugLog("ERROR", fmt.Sprintf("Не удалось установить переменную %s: %v", key, err))
@@ -551,7 +602,7 @@ func readEnvFile(filepath string) error {
 
 // createDirectories создает необходимые директории
 func createDirectories() {
-	dirs := []string{"./etc", "./logs"}
+	dirs := []string{configPath, logsPath}
 
 	for _, dir := range dirs {
 		if _, err := os.Stat(dir); os.IsNotExist(err) {
@@ -573,8 +624,9 @@ func createDirectories() {
 
 // clearLogFile очищает логфайл
 func clearLogFile() error {
-	// Создаем пустой файл или очищаем существующий
-	file, err := os.OpenFile("./logs/main.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	logFilePath := filepath.Join(logsPath, "main.log")
+
+	file, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		return fmt.Errorf("не удалось очистить логфайл: %v", err)
 	}
@@ -584,7 +636,9 @@ func clearLogFile() error {
 
 // writeToLogFile записывает сообщение в логфайл
 func writeToLogFile(message string) error {
-	logFile, err := os.OpenFile("./logs/main.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	logFilePath := filepath.Join(logsPath, "main.log")
+
+	logFile, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return fmt.Errorf("не удалось открыть логфайл: %v", err)
 	}
@@ -592,4 +646,23 @@ func writeToLogFile(message string) error {
 
 	_, err = logFile.WriteString(message + "\n")
 	return err
+}
+
+// gracefulShutdown корректно завершает работу
+func gracefulShutdown() {
+	debugLog("INFO", "Выполняется graceful shutdown...")
+
+	if dnsServer != nil {
+		debugLog("INFO", "Останавливаем DNS сервер...")
+
+		// Метод Shutdown не принимает контекст в этой версии библиотеки
+		err := dnsServer.Shutdown()
+		if err != nil {
+			debugLog("WARNING", fmt.Sprintf("Ошибка остановки сервера: %v", err))
+		} else {
+			debugLog("INFO", "DNS сервер успешно остановлен")
+		}
+	}
+
+	debugLog("INFO", "Graceful shutdown завершен")
 }

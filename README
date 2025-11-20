@@ -8,7 +8,7 @@
 
 Эта программа написана именно для решения данной проблемы, и конечно может работать не только в ЯО :)
 
-#
+# Linux:
 файл lsh-cdns это бинарник, можете его сами скомпилировать
 go mod tidy ; go build .
 
@@ -21,6 +21,23 @@ systemctl enable lsh-cdns
 после настроек можно
 systemctl start lsh-cdns
 
+# Windows:
+go mod tidy
+# Windows (консоль)
+GOOS=windows GOARCH=amd64 go build -o lsh-cdns-console.exe .
+
+# Windows (service)
+GOOS=windows GOARCH=amd64 go build -tags windows -o lsh-cdns-svc.exe .
+(я заметил что service версия как просто консольная тоже работает)
+
+# Создание службы
+sc create "lsh-cdns" binPath= "C:\путь\к\lsh-cdns-svc.exe" start= auto
+
+# Запуск службы
+sc start "lsh-cdns"
+sc query "lsh-cdns"
+
+################
 ### Настройки
 main.env
 Основные переменные
