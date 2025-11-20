@@ -1,5 +1,5 @@
 #SOF
-# Updated: 20251120
+#Updated: 2025112003
 
 Программа представляет собой DNS Proxy Resolver.
 Была написана для работы в yandex cloud, там есть проблема, связанная с тем, что ВМ из одного каталога
@@ -32,7 +32,7 @@ GOOS=windows GOARCH=amd64 go build -tags windows -o lsh-cdns-svc.exe .
 (я заметил что service версия как просто консольная тоже работает)
 
 # Создание службы
-sc create "lsh-cdns" binPath= "C:\путь\к\lsh-cdns-svc.exe" start= auto
+sc create "lsh-cdns" binPath= "C:\путь\к\lsh-cdns-svc.exe --service" start= auto
 
 # Запуск службы
 sc start "lsh-cdns"
